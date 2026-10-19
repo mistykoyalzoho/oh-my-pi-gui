@@ -41,6 +41,7 @@ import { useSubagentsStore } from "../../stores/subagents";
 import { toast } from "../../stores/toast";
 import { Badge, Button, Input, Modal, Spinner, type TabItem, Tabs } from "../common";
 import { type AgentSettingsRpc, type AgentSettingsState, useAgentSettings } from "./agent-hub-settings";
+import { ExpertTeamsTab } from "./ExpertTeamsTab";
 import { SubagentTranscript } from "./SubagentTranscript";
 import {
 	formatElapsed,
@@ -56,7 +57,7 @@ export interface AgentHubWindowProps {
 	initialTab?: AgentHubTabId;
 }
 
-export type AgentHubTabId = "definitions" | "hub";
+export type AgentHubTabId = "definitions" | "hub" | "teams";
 
 // ---------------------------------------------------------------------------
 // Definitions: settings-backed agent control center
@@ -999,6 +1000,7 @@ export function AgentHubWindow({ open, onClose, initialTab = "definitions" }: Ag
 		() => [
 			{ id: "definitions", label: t("agentHub.tabs.definitions") },
 			{ id: "hub", label: t("agentHub.tabs.hub"), badge: runningCount > 0 ? runningCount : undefined },
+			{ id: "teams", label: t("agentHub.tabs.teams") },
 		],
 		[t, runningCount],
 	);
@@ -1019,6 +1021,7 @@ export function AgentHubWindow({ open, onClose, initialTab = "definitions" }: Ag
 				/>
 				{tab === "definitions" && <DefinitionsTab rpc={settings} />}
 				{tab === "hub" && <HubTab />}
+				{tab === "teams" && <ExpertTeamsTab />}
 			</div>
 		</Modal>
 	);

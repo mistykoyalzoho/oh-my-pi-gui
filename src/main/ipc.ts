@@ -1,10 +1,12 @@
 /**
  * Registers all IPC handlers and wires sidecar events to renderer windows.
  */
+
+import { randomUUID } from "node:crypto";
 import { type Dirent, existsSync, promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { BrowserWindow, clipboard, dialog, ipcMain, Notification, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Notification, shell } from "electron";
 import Store from "electron-store";
 import type {
 	ConversationSearchResponse,
@@ -16,6 +18,9 @@ import type {
 	IpcBrowserViewportPayload,
 	IpcCloseTabPayload,
 	IpcConversationSearchPayload,
+	IpcExpertTeamEvent,
+	IpcExpertTeamRunPayload,
+	IpcExpertTeamsCatalog,
 	IpcExtensionUiRespondPayload,
 	IpcFsListPayload,
 	IpcFsReadImagePayload,
@@ -49,13 +54,14 @@ import type {
 import { IPC_COMMANDS, IPC_EVENTS, type RunProgressState, type TrayState } from "../shared/ipc-types";
 import { isLanguage } from "../shared/languages";
 import { parseLaunchProfile } from "../shared/launch-profile";
-import type { RpcCommand, RpcSessionState } from "../shared/rpc-types";
+import type { AgentSessionEvent, RpcCommand, RpcSessionState } from "../shared/rpc-types";
 import { requestQuit } from "./app-quit";
 import { BenchmarkRunner } from "./benchmark-runner";
 import type { BrowserHost } from "./browser-host";
 import type { ConversationIndex } from "./conversation-index";
 import { ensureDefaultWorkspace } from "./default-workspace";
 import { openInExternalEditor } from "./editor";
+import { buildExpertRolePrompts, listExpertTeams } from "./expert-teams";
 import { mainT } from "./i18n";
 import type { LogWatcher } from "./log-watcher";
 import type { MemoryWatcher } from "./memory-watcher";
@@ -372,6 +378,21 @@ function aggregateProgress(states: RunProgressState[]): RunProgressState {
 
 export function registerIpcHandlers(deps: IpcDeps): void {
 	const benchmarkRunners = new Map<number, BenchmarkRunner>();
+	const expertRuns = new Map<
+		string,
+		{
+			runId: string;
+			teamId: string;
+			tabId: string;
+			sidecar: SidecarManager;
+			win: BrowserWindow;
+			cancelled: boolean;
+			currentRole?: string;
+			cancelTurn?: () => void;
+		}
+	>();
+	const expertRunBySidecar = new Map<SidecarManager, string>();
+	const expertRunSnapshots = new Map<number, IpcExpertTeamEvent>();
 	const { sidecarPool, sessionIndex, statsClient, logWatcher, memoryWatcher, windowManager } = deps;
 	const prefsStore = new Store<PrefsSchema>({ name: "prefs" });
 
@@ -382,6 +403,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 		progressStates.delete(record.id);
 		benchmarkRunners.get(record.id)?.abort();
 		benchmarkRunners.delete(record.id);
+		expertRunSnapshots.delete(record.id);
 	});
 
 	// Sidecar → owning-window event forwarding (events/status/extensionUi/
@@ -477,6 +499,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 		sidecar: SidecarManager | null,
 		issuerTabId: string | null,
 		payload: IpcRpcCommandPayload,
+		expertRunId?: string,
 	) => {
 		const client = sidecar?.rpcClient;
 		if (!client || !sidecar) {
@@ -491,6 +514,15 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 			};
 		}
 		const { id: _id, ...cmd } = payload.command;
+		const activeExpertRun = expertRunBySidecar.get(sidecar);
+		if (activeExpertRun && activeExpertRun !== expertRunId && cmd.type !== "get_state") {
+			return {
+				id: _id,
+				type: "response",
+				success: false,
+				error: "An expert team owns this session until it finishes or is cancelled",
+			};
+		}
 		// F-OWN refuse-or-focus backstop: a switch_session onto a file a
 		// DIFFERENT tab owns would double-attach it (the owner itself re-attaches
 		// freely). Refuse BEFORE dispatch — the sidecar would attach for real
@@ -544,6 +576,255 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 			};
 		}
 	};
+
+	const sendExpertEvent = (win: BrowserWindow, event: IpcExpertTeamEvent): void => {
+		if (!win.isDestroyed()) {
+			expertRunSnapshots.set(win.id, event);
+			win.webContents.send(IPC_EVENTS.EXPERT_TEAM_EVENT, event);
+		}
+	};
+
+	const saveExpertResult = async (runId: string, teamId: string, result: string): Promise<string> => {
+		const dir = path.join(app.getPath("userData"), "expert-team-runs");
+		await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+		const file = path.join(dir, `${runId}.json`);
+		const handle = await fsp.open(file, "wx", 0o600);
+		try {
+			await handle.writeFile(JSON.stringify({ runId, teamId, completedAt: new Date().toISOString(), result }));
+		} finally {
+			await handle.close();
+		}
+		return file;
+	};
+
+	const runExpertTeam = async (
+		ctx: NonNullable<ReturnType<typeof expertRuns.get>>,
+		prompts: string[],
+		teamName: string,
+		description: string,
+		task: string,
+	): Promise<void> => {
+		const findings: string[] = [];
+		let eventListener: ((events: AgentSessionEvent[]) => void) | undefined;
+		const cleanup = (): void => {
+			if (eventListener) ctx.sidecar.off("events", eventListener);
+			expertRuns.delete(ctx.runId);
+			if (expertRunBySidecar.get(ctx.sidecar) === ctx.runId) expertRunBySidecar.delete(ctx.sidecar);
+		};
+		const turn = async (prompt: string, maxChars = 6_000): Promise<string> => {
+			let failWait: (error: Error) => void = () => {};
+			const terminal = new Promise<string>((resolve, reject) => {
+				let timer: ReturnType<typeof setTimeout>;
+				const listener = (events: AgentSessionEvent[]): void => {
+					for (const event of events) {
+						if (event.type !== "agent_end" || event.isTerminal === false) continue;
+						const message = [...(event.messages ?? [])].reverse().find(item => item.role === "assistant");
+						const content =
+							typeof message?.content === "string"
+								? message.content
+								: Array.isArray(message?.content)
+									? message.content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("\n")
+									: "";
+						const marker = `\n\n[Expert output clipped at ${maxChars} characters]`;
+						const bounded =
+							content.length > maxChars ? `${content.slice(0, maxChars - marker.length)}${marker}` : content;
+						if (message?.stopReason === "error" || message?.errorMessage) {
+							finish(() =>
+								reject(new Error(message.errorMessage || "Provider ended the expert turn with an error")),
+							);
+							return;
+						}
+						if (message?.stopReason === "aborted" && !ctx.cancelled) {
+							finish(() => reject(new Error("Provider aborted the expert turn")));
+							return;
+						}
+						finish(() => resolve(bounded));
+						return;
+					}
+				};
+				const finish = (action: () => void): void => {
+					clearTimeout(timer);
+					ctx.sidecar.off("events", listener);
+					ctx.sidecar.off("status", statusListener);
+					if (ctx.cancelTurn === cancel) ctx.cancelTurn = undefined;
+					action();
+				};
+				const cancel = (): void => finish(() => reject(new Error("Expert team cancelled")));
+				const statusListener = ({ status }: { status: string }): void => {
+					if (status !== "ready") finish(() => reject(new Error(`Sidecar disconnected (${status})`)));
+				};
+				timer = setTimeout(
+					() => finish(() => reject(new Error("Expert turn timed out after 10 minutes"))),
+					10 * 60 * 1000,
+				);
+				eventListener = listener;
+				failWait = error => finish(() => reject(error));
+				ctx.cancelTurn = cancel;
+				ctx.sidecar.on("events", listener);
+				ctx.sidecar.on("status", statusListener);
+			});
+			// Cancellation can reject while the prompt acknowledgement is still pending.
+			void terminal.catch(() => {});
+			let response: Awaited<ReturnType<typeof dispatchRpcCommand>>;
+			try {
+				response = await dispatchRpcCommand(
+					ctx.win,
+					ctx.sidecar,
+					ctx.tabId,
+					{
+						command: { type: "prompt", message: prompt },
+						timeoutMs: 30_000,
+					},
+					ctx.runId,
+				);
+			} catch (error) {
+				failWait(error instanceof Error ? error : new Error(String(error)));
+				return terminal;
+			}
+			if (!response.success) {
+				failWait(new Error(response.error || "Provider rejected expert turn"));
+			}
+			return terminal;
+		};
+		try {
+			for (let i = 0; i < prompts.length; i++) {
+				if (ctx.cancelled) return;
+				ctx.currentRole = `Expert ${i + 1} of ${prompts.length}`;
+				sendExpertEvent(ctx.win, {
+					runId: ctx.runId,
+					teamId: ctx.teamId,
+					status: "started",
+					currentRole: ctx.currentRole,
+				});
+				const prompt = findings.length
+					? `${prompts[i]}\n\n## Prior expert findings\n${findings.map((item, index) => `### Expert ${index + 1}\n${item}`).join("\n\n")}`
+					: prompts[i];
+				findings.push(await turn(prompt));
+			}
+			if (ctx.cancelled) return;
+			ctx.currentRole = "Synthesis";
+			sendExpertEvent(ctx.win, {
+				runId: ctx.runId,
+				teamId: ctx.teamId,
+				status: "started",
+				currentRole: "Synthesis",
+			});
+			const synthesis = [
+				`Synthesize the ${teamName} experts' findings for this task. Team purpose: ${description}`,
+				"Resolve conflicts with evidence, preserve useful disagreement, and state unresolved issues. Do not invent work or claim separate models or agents.",
+				...findings.map((item, index) => `## Expert ${index + 1} findings\n${item}`),
+				`## Original task\n${task}`,
+			].join("\n\n");
+			if (synthesis.length > 96 * 1024) throw new Error("Expert findings exceed the 96 KiB synthesis prompt limit");
+			const result = await turn(synthesis, 128 * 1024);
+			if (ctx.cancelled) return;
+			const artifactPath = await saveExpertResult(ctx.runId, ctx.teamId, result);
+			sendExpertEvent(ctx.win, {
+				runId: ctx.runId,
+				teamId: ctx.teamId,
+				status: "completed",
+				result,
+				truncated: result.includes("[Expert output clipped at 131072 characters]"),
+				artifactPath,
+			});
+		} catch (error) {
+			if (!ctx.cancelled && ctx.sidecar.status === "ready") {
+				await dispatchRpcCommand(ctx.win, ctx.sidecar, ctx.tabId, { command: { type: "abort" } }, ctx.runId).catch(
+					() => {},
+				);
+			}
+			if (!ctx.cancelled)
+				sendExpertEvent(ctx.win, {
+					runId: ctx.runId,
+					teamId: ctx.teamId,
+					status: "failed",
+					error: error instanceof Error ? error.message : String(error),
+				});
+		} finally {
+			cleanup();
+		}
+	};
+
+	ipcMain.handle(IPC_COMMANDS.EXPERT_TEAM_LIST, async (event): Promise<IpcExpertTeamsCatalog> => {
+		const catalog = await listExpertTeams();
+		const win = BrowserWindow.fromWebContents(event.sender);
+		return {
+			...catalog,
+			latestRun: win ? expertRunSnapshots.get(win.id) : undefined,
+			marketplaces: [
+				{ name: "Skills", url: "https://skills.sh/", kind: "skills", compatibility: "external-catalog" },
+				{
+					name: "Anthropic Skills",
+					url: "https://github.com/anthropics/skills",
+					kind: "skills",
+					compatibility: "external-catalog",
+				},
+				{
+					name: "MCP Registry",
+					url: "https://registry.modelcontextprotocol.io/",
+					kind: "mcp",
+					compatibility: "external-catalog",
+				},
+				{
+					name: "MCP Servers",
+					url: "https://github.com/modelcontextprotocol/servers",
+					kind: "mcp",
+					compatibility: "external-catalog",
+				},
+				{
+					name: "GitHub Plugins",
+					url: "https://github.com/topics/agent-plugins",
+					kind: "plugins",
+					compatibility: "external-catalog",
+				},
+			],
+		};
+	});
+
+	ipcMain.handle(IPC_COMMANDS.EXPERT_TEAM_RUN, async (event, payload: IpcExpertTeamRunPayload) => {
+		const win = BrowserWindow.fromWebContents(event.sender);
+		if (!win) throw new Error("No window");
+		if (typeof payload?.teamId !== "string" || typeof payload.task !== "string")
+			throw new Error("Invalid expert team request");
+		const teams = await listExpertTeams();
+		const team = teams.teams.find(item => item.id === payload.teamId);
+		if (!team) throw new Error("Expert team not found");
+		const tabId = sidecarPool.activeTabForWindow(win);
+		const sidecar = sidecarPool.sidecarForWindow(win);
+		if (!tabId || !sidecar || sidecar.status !== "ready") throw new Error("Active agent session is not ready");
+		if (expertRunBySidecar.has(sidecar)) throw new Error("An expert team is already running in this session");
+		const runId = randomUUID();
+		const ctx = { runId, teamId: team.id, tabId, sidecar, win, cancelled: false };
+		expertRuns.set(runId, ctx);
+		expertRunBySidecar.set(sidecar, runId);
+		let prompts: string[];
+		try {
+			const stateResponse = await dispatchRpcCommand(win, sidecar, tabId, { command: { type: "get_state" } });
+			const state = stateResponse.success ? (stateResponse.data as RpcSessionState) : undefined;
+			if (!state)
+				throw new Error(("error" in stateResponse && stateResponse.error) || "Could not inspect active session");
+			if (state.isStreaming || state.isCompacting || state.hasPendingAsyncWork)
+				throw new Error("Wait for the active session to become idle before running an expert team");
+			prompts = await buildExpertRolePrompts(team, payload.task);
+		} catch (error) {
+			expertRuns.delete(runId);
+			expertRunBySidecar.delete(sidecar);
+			throw error;
+		}
+		void runExpertTeam(ctx, prompts, team.name, team.description, payload.task);
+		return { runId };
+	});
+
+	ipcMain.handle(IPC_COMMANDS.EXPERT_TEAM_CANCEL, async (event, payload: { runId?: string }) => {
+		const run = typeof payload?.runId === "string" ? expertRuns.get(payload.runId) : undefined;
+		const win = BrowserWindow.fromWebContents(event.sender);
+		if (!run || !win || run.win !== win) return { cancelled: false };
+		run.cancelled = true;
+		run.cancelTurn?.();
+		sendExpertEvent(win, { runId: run.runId, teamId: run.teamId, status: "cancelled" });
+		await dispatchRpcCommand(win, run.sidecar, run.tabId, { command: { type: "abort" } }, run.runId);
+		return { cancelled: true };
+	});
 
 	ipcMain.handle(IPC_COMMANDS.RPC_COMMAND, async (event, payload: IpcRpcCommandPayload) => {
 		const win = BrowserWindow.fromWebContents(event.sender);

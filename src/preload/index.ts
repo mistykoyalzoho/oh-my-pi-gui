@@ -17,6 +17,9 @@ import type {
 	IpcBrowserState,
 	IpcBrowserViewportPayload,
 	IpcConversationSearchPayload,
+	IpcExpertTeamEvent,
+	IpcExpertTeamRunPayload,
+	IpcExpertTeamsCatalog,
 	IpcFsListResult,
 	IpcFsReadImageResult,
 	IpcFsReadPlanPayload,
@@ -116,6 +119,14 @@ function subscribeTab<T>(channel: string, callback: (data: T, tabId: string) => 
 }
 
 const api: OmpApi = {
+	expertTeams: {
+		list: () => ipcRenderer.invoke(IPC_COMMANDS.EXPERT_TEAM_LIST) as Promise<IpcExpertTeamsCatalog>,
+		run: (payload: IpcExpertTeamRunPayload) =>
+			ipcRenderer.invoke(IPC_COMMANDS.EXPERT_TEAM_RUN, payload) as Promise<{ runId: string }>,
+		cancel: (runId: string) =>
+			ipcRenderer.invoke(IPC_COMMANDS.EXPERT_TEAM_CANCEL, { runId }) as Promise<{ cancelled: boolean }>,
+		onEvent: (callback: (event: IpcExpertTeamEvent) => void) => subscribe(IPC_EVENTS.EXPERT_TEAM_EVENT, callback),
+	},
 	runtime: {
 		report: (error: RuntimeErrorReport) => ipcRenderer.send(IPC_COMMANDS.RUNTIME_ERROR_REPORT, error),
 		logPath: () => ipcRenderer.invoke(IPC_COMMANDS.RUNTIME_LOG_PATH) as Promise<string>,

@@ -108,6 +108,8 @@ export const IPC_EVENTS = {
 	BROWSER_STATE: "browser:state",
 	/** A key the focused built-in browser page handed to the app (IpcBrowserKeyPayload). */
 	BROWSER_KEY: "browser:key",
+	/** Expert team lifecycle for the calling window. */
+	EXPERT_TEAM_EVENT: "expert-team:event",
 } as const;
 
 // ============================================================================
@@ -127,6 +129,9 @@ export const IPC_COMMANDS = {
 	RPC_COMMAND: "rpc:command",
 	/** Send an RPC command to a specific tab's sidecar (IpcRpcCommandForTabPayload). */
 	RPC_COMMAND_FOR_TAB: "rpc:command-for-tab",
+	EXPERT_TEAM_LIST: "expert-team:list",
+	EXPERT_TEAM_RUN: "expert-team:run",
+	EXPERT_TEAM_CANCEL: "expert-team:cancel",
 	/** Respond to extension UI request */
 	EXTENSION_UI_RESPOND: "extension-ui:respond",
 	/** Send host tool result */
@@ -428,6 +433,57 @@ export interface IpcRpcCommandForTabPayload {
 	tabId: string;
 	command: RpcCommand;
 	timeoutMs?: number;
+}
+
+export interface IpcExpertRole {
+	id: string;
+	name: string;
+	description: string;
+	instructions: string;
+	skills: string[];
+}
+
+export interface IpcExpertTeam {
+	id: string;
+	name: string;
+	description: string;
+	category: string;
+	roles: IpcExpertRole[];
+	path: string;
+}
+
+export interface IpcSkillSummary {
+	name: string;
+	description: string;
+	path: string;
+}
+
+export interface IpcExpertTeamsCatalog {
+	teams: IpcExpertTeam[];
+	skills: IpcSkillSummary[];
+	marketplaces: Array<{
+		name: string;
+		url: string;
+		kind: "skills" | "mcp" | "plugins";
+		compatibility: "external-catalog";
+	}>;
+	latestRun?: IpcExpertTeamEvent;
+}
+
+export interface IpcExpertTeamRunPayload {
+	teamId: string;
+	task: string;
+}
+
+export interface IpcExpertTeamEvent {
+	runId: string;
+	teamId: string;
+	status: "started" | "completed" | "cancelled" | "failed";
+	currentRole?: string;
+	result?: string;
+	truncated?: boolean;
+	error?: string;
+	artifactPath?: string;
 }
 
 export interface IpcEventsBatchPayload {
@@ -1053,6 +1109,12 @@ export interface SystemInfo {
 }
 
 export interface OmpApi {
+	expertTeams: {
+		list(): Promise<IpcExpertTeamsCatalog>;
+		run(payload: IpcExpertTeamRunPayload): Promise<{ runId: string }>;
+		cancel(runId: string): Promise<{ cancelled: boolean }>;
+		onEvent(callback: (event: IpcExpertTeamEvent) => void): () => void;
+	};
 	runtime: {
 		/** Best-effort fire-and-forget reporting so fatal render paths never wait on IPC. */
 		report(error: RuntimeErrorReport): void;
